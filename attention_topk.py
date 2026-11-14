@@ -8,11 +8,11 @@ Kept per token i: union of the top-K previous tokens and the top-P nucleus (smal
 previous tokens whose norm_scores sum to >= P).
 
 Inference runs on Modal; results are pushed to a public HF dataset with configs:
-    tokens:    one row for the document (text, input_ids, tokens, offsets)
     attention: one row per token        (token_idx, token_id, attended_idx, scores, norm_scores, candidate_mass)
+    tokens: currently only one row, list of tokens and list of strings corresponding to them
 plus run_config.json with the parameters used.
 
-Attention probabilities are computed exactly (fp32) by a custom causal attention backend, chunked over query rows so
+Attention probabilities are computed by a custom causal attention backend, chunked over query rows so
 that memory stays bounded for long inputs; the rest of the model runs as usual (FP8 linear layers, bf16 elsewhere).
 
 Usage:
@@ -60,7 +60,7 @@ class AttentionRecorder:
         self.layers = set(layers)
         self.mem_budget_bytes = mem_budget_gb * 2**30
         self.acc = None
-        self.seen_layers: List[int] = []
+        self.seen_layers: Set[int] = []
 
 
 RECORDER: Optional[AttentionRecorder] = None
@@ -76,9 +76,10 @@ def probe_attention_forward(module, query, key, value, attention_mask, scaling, 
     import torch
 
     rec = RECORDER
-    bsz, n_heads, seq_len, head_dim = query.shape
+    bsz, n_heads, _, head_dim = query.shape
+    seq_len = key.shape[2]
     assert bsz == 1, "probe attention supports a single sequence"
-    assert key.shape[2] == seq_len, "probe attention expects a full forward pass without KV cache"
+    assert query.shape[2] == seq_len, "probe attention expects a full forward pass without KV cache"
     assert getattr(module, "sliding_window", None) is None, "sliding window attention is not supported"
     n_kv = key.shape[1]
     groups = n_heads // n_kv
@@ -87,7 +88,8 @@ def probe_attention_forward(module, query, key, value, attention_mask, scaling, 
     if record:
         if rec.acc is None:
             rec.acc = torch.zeros(seq_len, seq_len, dtype=torch.float32, device=dev)
-        rec.seen_layers.append(module.layer_idx)
+        assert module.layer_idx not in rec.seen_layers
+        rec.seen_layers.add(module.layer_idx)
 
     # head h uses kv head h // groups (same as HF repeat_kv)
     q = query[0].float().view(n_kv, groups, seq_len, head_dim)
@@ -95,7 +97,7 @@ def probe_attention_forward(module, query, key, value, attention_mask, scaling, 
     v = value[0].float().unsqueeze(1)  # [Hkv, 1, T, D]
     out = torch.empty(n_kv, groups, seq_len, head_dim, dtype=torch.float32, device=dev)
 
-    # ~3 live fp32 tensors of shape [H, chunk, T] per chunk
+    # we do chunking sice calculating everything at once may be infeasible
     budget = rec.mem_budget_bytes if rec is not None else 4 * 2**30
     chunk = max(1, min(seq_len, int(budget // (3 * 4 * n_heads * seq_len))))
 
@@ -196,7 +198,7 @@ def _attention_matrix(model, input_ids: List[int], layers: List[int], mem_budget
     # base model only: skips the [T, vocab] logits
     model.model(input_ids=ids, use_cache=False)
     rec, RECORDER = RECORDER, None
-    assert sorted(rec.seen_layers) == sorted(layers), (rec.seen_layers, layers)
+    assert sorted(list(rec.seen_layers)) == sorted(layers), (rec.seen_layers, layers)
     return rec.acc.div_(len(layers))
 
 
